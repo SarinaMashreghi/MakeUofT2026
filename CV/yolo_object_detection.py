@@ -54,7 +54,6 @@ def preprocess_roi_for_emotion(roi_bgr: np.ndarray, model_input_shape: Tuple[Opt
 def main():
     # --------- Config ----------
     model_path = "yolov8n.pt"   # or your trained .pt file
-    # model_path = "yolov8n-face.pt"
     emotion_model_path = "face_recognition_v1.keras"
     webcam_index = 0            # change to 1/2 if you have multiple cameras
     conf_thres = 0.35

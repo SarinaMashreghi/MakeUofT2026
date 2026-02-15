@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Robot Monitor</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+  </head>
+  <body>
+    <main class="wrap">
+      <h1>Robot Monitor Feed</h1>
+      <p class="hint">Live stream from <code>/video_feed</code></p>
+      <img id="feed" src="/video_feed" alt="Robot camera feed" />
+      <p id="status" class="status">Connecting...</p>
+    </main>
+    <script>
+      const statusEl = document.getElementById("status");
+      const feedEl = document.getElementById("feed");
+
+      feedEl.addEventListener("load", () => {
+        statusEl.textContent = "Streaming";
+      });
+
+      feedEl.addEventListener("error", () => {
+        statusEl.textContent = "Feed error. Check /status and camera index.";
+      });
+
+      async function pollStatus() {
+        try {
+          const res = await fetch("/status", { cache: "no-store" });
+          const data = await res.json();
+          if (!data.streaming) {
+            statusEl.textContent = "Server up, waiting for first frame...";
+          }
+        } catch (_) {
+          statusEl.textContent = "Status endpoint unreachable.";
+        }
+      }
+
+      setInterval(pollStatus, 1500);
+      pollStatus();
+    </script>
+  </body>
+</html>

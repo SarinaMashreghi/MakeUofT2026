@@ -14,6 +14,11 @@ Current flow:
 - Event hooks:
   - `on_happy_detected(...)`
   - `on_sad_detected(...)` (`sad` means any non-`happy` emotion)
+- Web UI:
+  - Template: `robot_monitor/web/templates/index.html`
+  - Static CSS: `robot_monitor/web/static/styles.css`
+  - Stream endpoint: `/video_feed`
+  - Health endpoint: `/status`
 
 Integration points to add later:
 - ESP motion commands (inside the event hooks)
