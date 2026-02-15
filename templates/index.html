@@ -1,0 +1,196 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Looping Voice Chat (Gemini → ElevenLabs)</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 24px auto; padding: 0 12px; }
+    button { padding: 10px 14px; margin-right: 8px; }
+    .row { margin: 12px 0; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    .box { border: 1px solid #ddd; border-radius: 10px; padding: 12px; margin-top: 12px; }
+    #status { color: #444; }
+    #userText, #reply { white-space: pre-wrap; }
+    audio { width: 100%; margin-top: 8px; }
+    .small { font-size: 0.9rem; color: #666; }
+  </style>
+</head>
+<body>
+  <h2>Looping voice conversation</h2>
+  <p class="small">
+    Click <b>Start Conversation</b> once. It will record, send, play reply, and repeat.
+    Say <b>"end"</b> (or stop/bye/quit) to stop the loop.
+  </p>
+
+  <div class="row">
+    <button id="btnStart">Start Conversation</button>
+    <button id="btnEnd" disabled>End Conversation</button>
+    <span id="status">Idle</span>
+  </div>
+
+  <div class="box">
+    <h3>You said (transcript)</h3>
+    <div id="userText">(none yet)</div>
+  </div>
+
+  <div class="box">
+    <h3>Assistant reply</h3>
+    <div id="reply">(none yet)</div>
+  </div>
+
+  <div class="box">
+    <h3>Audio reply</h3>
+    <audio id="player" controls></audio>
+  </div>
+
+  <script>
+    const btnStart = document.getElementById("btnStart");
+    const btnEnd   = document.getElementById("btnEnd");
+    const statusEl = document.getElementById("status");
+    const userEl   = document.getElementById("userText");
+    const replyEl  = document.getElementById("reply");
+    const player   = document.getElementById("player");
+
+    // --- Conversation loop state ---
+    let running = false;
+    let stream = null;
+    let mediaRecorder = null;
+    let chunks = [];
+
+    // Length of each "turn" recording (seconds)
+    const TURN_SECONDS = 4.0;
+
+    function setStatus(s) { statusEl.textContent = s; }
+
+    async function initMic() {
+      if (stream) return stream;
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      return stream;
+    }
+
+    function sleep(ms) {
+      return new Promise(r => setTimeout(r, ms));
+    }
+
+    async function recordOneTurn() {
+      chunks = [];
+      const s = await initMic();
+
+      // Create a new recorder each turn (simple + reliable)
+      mediaRecorder = new MediaRecorder(s);
+
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunks.push(e.data);
+      };
+
+      mediaRecorder.start();
+      setStatus(`Recording (${TURN_SECONDS}s)...`);
+
+      await sleep(TURN_SECONDS * 1000);
+
+      // stop -> wait for stop event to finalize data
+      const stopped = new Promise(resolve => {
+        mediaRecorder.onstop = resolve;
+      });
+
+      mediaRecorder.stop();
+      await stopped;
+
+      const blob = new Blob(chunks, { type: mediaRecorder.mimeType || "audio/webm" });
+      return blob;
+    }
+
+    async function sendTurn(blob) {
+      setStatus("Uploading...");
+      const form = new FormData();
+      form.append("audio", blob, "mic.webm");
+
+      const res = await fetch("/api/process", { method: "POST", body: form });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Server error");
+      return data;
+    }
+
+    function playAudio(url) {
+      return new Promise((resolve) => {
+        if (!url) return resolve();
+
+        // cache-bust
+        player.src = url + "?t=" + Date.now();
+        player.onended = () => resolve();
+        player.onerror = () => resolve();
+
+        // Try autoplay; if blocked, user can press play manually
+        const p = player.play();
+        if (p && typeof p.catch === "function") p.catch(() => resolve());
+      });
+    }
+
+    async function conversationLoop() {
+      while (running) {
+        try {
+          const blob = await recordOneTurn();
+          if (!running) break;
+
+          const data = await sendTurn(blob);
+          userEl.textContent = data.user_text || "(no transcript)";
+          replyEl.textContent = data.text || "(no reply)";
+
+          // If server says end_session, play goodbye then stop
+          if (data.end_session) {
+            setStatus("Ending (server detected end)...");
+            await playAudio(data.audio_url);
+            running = false;
+            break;
+          }
+
+          setStatus("Playing reply...");
+          await playAudio(data.audio_url);
+
+          // small pause to avoid immediate re-record pickup
+          await sleep(250);
+        } catch (err) {
+          setStatus("Error");
+          replyEl.textContent = String(err);
+          // stop loop on error (keeps it simple)
+          running = false;
+          break;
+        }
+      }
+
+      // cleanup UI
+      setStatus("Idle");
+      btnStart.disabled = false;
+      btnEnd.disabled = true;
+    }
+
+    btnStart.onclick = async () => {
+      if (running) return;
+      running = true;
+      btnStart.disabled = true;
+      btnEnd.disabled = false;
+      setStatus("Starting...");
+
+      try {
+        await initMic();
+      } catch (e) {
+        running = false;
+        setStatus("Mic permission denied");
+        replyEl.textContent = String(e);
+        btnStart.disabled = false;
+        btnEnd.disabled = true;
+        return;
+      }
+
+      conversationLoop();
+    };
+
+    btnEnd.onclick = () => {
+      running = false;
+      setStatus("Stopping...");
+      // Optional: you can also call /api/reset if you want:
+      fetch("/api/reset", { method: "POST" }).catch(()=>{});
+    };
+  </script>
+</body>
+</html>
