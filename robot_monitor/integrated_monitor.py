@@ -7,7 +7,7 @@ import torch
 from transformers import AutoImageProcessor, AutoModelForImageClassification
 from ultralytics import YOLO
 
-ESP = serial.Serial("COM3", 115200)
+ESP = serial.Serial("COM9", 115200)
 
 time.sleep(2)
 print("Connected to ESP32!")
@@ -106,23 +106,23 @@ def go_to_person(person_id: int, bbox: Tuple[int, int, int, int], frame_shape: T
     strong_turn = 0.45
 
     if abs_e <= deadband:
-        send_motion_command("F", cooldown_s=0.18)
+        send_motion_command("F", cooldown_s=1)
         return
 
     if abs_e < enter_turn:
-        send_motion_command("F", cooldown_s=0.18)
+        send_motion_command("F", cooldown_s=1)
         return
 
     if e < 0:
         if abs_e >= strong_turn:
-            send_motion_command("L", cooldown_s=0.06)
+            send_motion_command("L", cooldown_s=0.5)
         else:
-            send_motion_command("L", cooldown_s=0.12)
+            send_motion_command("L", cooldown_s=0.5)
     else:
         if abs_e >= strong_turn:
-            send_motion_command("R", cooldown_s=0.06)
+            send_motion_command("R", cooldown_s=0.5)
         else:
-            send_motion_command("R", cooldown_s=0.12)
+            send_motion_command("R", cooldown_s=0.5)
 
 
 def reached_person(
@@ -168,7 +168,7 @@ def detect_emotion(
 
 def main() -> None:
     # ---- Config ----
-    webcam_index = 0
+    webcam_index = 1
     yolo_model_path = "./models/yolov8n.pt"
     emotion_model_dir = "./models/hugging_face_vit"
     yolo_conf = 0.50

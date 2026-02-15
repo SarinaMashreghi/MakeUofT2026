@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gemini Voice</title>
+    <style>
+        body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; background: #f0f2f5; margin: 0; padding: 20px; text-align: center;}
+        #status { margin-bottom: 10px; font-weight: bold; color: #007bff; }
+        #transcript { margin: 15px; padding: 15px; border: 2px dashed #007bff; width: 90%; min-height: 60px; background: white; border-radius: 10px; }
+        button { padding: 25px; width: 100%; max-width: 300px; font-size: 1.2rem; cursor: pointer; border-radius: 50px; border: none; background: #007bff; color: white; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+    <div id="status">System Ready</div>
+    <div id="transcript">Your words will appear here...</div>
+    <button id="mic-btn">Start Listening</button>
+
+    <script>
+        const btn = document.getElementById('mic-btn');
+        const status = document.getElementById('status');
+        const transcriptDiv = document.getElementById('transcript');
+
+        // Check for Browser Support
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!SpeechRecognition) {
+            status.innerText = "Error: Browser does not support Speech Recognition";
+        }
+
+        const recognition = new SpeechRecognition();
+        const synth = window.speechSynthesis;
+
+        recognition.continuous = true;
+        recognition.interimResults = true;
+        recognition.lang = 'en-US';
+
+        let isListening = false;
+
+        recognition.onstart = () => {
+            console.log("Recognition started");
+            status.innerText = "Listening... Speak now.";
+            transcriptDiv.innerText = "";
+        };
+
+        recognition.onresult = (event) => {
+            let text = "";
+            for (let i = event.resultIndex; i < event.results.length; ++i) {
+                text += event.results[i][0].transcript;
+            }
+            transcriptDiv.innerText = text;
+            console.log("Heard:", text);
+        };
+
+        recognition.onerror = (event) => {
+            console.error("Speech Error:", event.error);
+            status.innerText = "Error: " + event.error;
+        };
+
+        async function sendToGemini() {
+            const text = transcriptDiv.innerText;
+            if (!text || text === "Your words will appear here...") {
+                status.innerText = "No text detected. Try again.";
+                return;
+            }
+
+            status.innerText = "Gemini is thinking...";
+            try {
+                const response = await fetch('/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ text: text })
+                });
+                const data = await response.json();
+                console.log("Gemini says:", data.reply);
+                speak(data.reply);
+            } catch (e) {
+                console.error("Fetch Error:", e);
+                status.innerText = "Server Error. Check your Flask terminal.";
+            }
+        }
+
+        function speak(text) {
+            const utterance = new SpeechSynthesisUtterance(text);
+            utterance.onstart = () => status.innerText = "Gemini speaking...";
+            utterance.onend = () => {
+                status.innerText = "System Ready";
+                btn.innerText = "Start Listening";
+                btn.style.background = "#007bff";
+            };
+            synth.speak(utterance);
+        }
+
+        btn.onclick = () => {
+            if (!isListening) {
+                try {
+                    recognition.start();
+                    isListening = true;
+                    btn.innerText = "STOP & SEND";
+                    btn.style.background = "#dc3545";
+                } catch (e) {
+                    console.error("Start Error:", e);
+                }
+            } else {
+                recognition.stop();
+                isListening = false;
+                sendToGemini();
+            }
+        };
+    </script>
+</body>
+</html>
