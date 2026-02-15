@@ -173,8 +173,28 @@ def main() -> None:
     emotion_model_dir = "./models/hugging_face_vit"
     yolo_conf = 0.50
     imgsz = 416
+<<<<<<< Updated upstream
     window_name = "Robot Monitor"
     # --------------
+=======
+    web_host = "0.0.0.0"
+    web_port = 5005
+    stream_width = 600
+    stream_height = 360
+
+    motion = ESPMotionController(port="COM9")
+    web = WebStreamer(base_dir=Path(__file__).resolve().parent)
+    web.start_in_thread(host=web_host, port=web_port)
+    web.set_runtime_state(
+        robot_state="idle",
+        robot_direction="none",
+        esp_connected=motion.is_connected(),
+        esp_error=motion.get_last_error(),
+    )
+    
+    print(f"Web UI: http://localhost:{web_port}")
+    print("Loading models...")
+>>>>>>> Stashed changes
 
     person_detector = YOLO(yolo_model_path)
 
@@ -245,9 +265,173 @@ def main() -> None:
                 )
             ultrasonic_distance_cm = get_ultrasonic_distance_cm()
 
+<<<<<<< Updated upstream
             for person_idx, (x1, y1, x2, y2, p_conf, class_name) in enumerate(detections):
                 if class_name != "person":
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (220, 140, 0), 2)
+=======
+            try:
+                yolo_results = person_detector.predict(
+                    source=frame,
+                    imgsz=imgsz,
+                    conf=yolo_conf,
+                    verbose=False,
+                )
+
+                boxes = yolo_results[0].boxes
+                if boxes is not None and len(boxes) > 0:
+                    xyxy = boxes.xyxy.cpu().numpy()
+                    confs = boxes.conf.cpu().numpy()
+                    cls_ids = boxes.cls.cpu().numpy()
+                    for (x1, y1, x2, y2), conf, cls_id in zip(xyxy, confs, cls_ids):
+                        x1i = max(0, min(int(x1), w - 1))
+                        y1i = max(0, min(int(y1), h - 1))
+                        x2i = max(0, min(int(x2), w - 1))
+                        y2i = max(0, min(int(y2), h - 1))
+                        if x2i > x1i and y2i > y1i:
+                            cls_idx = int(cls_id)
+                            if isinstance(names, dict):
+                                class_name = str(names.get(cls_idx, "unknown")).lower()
+                            else:
+                                class_name = str(names[cls_idx]).lower() if 0 <= cls_idx < len(names) else "unknown"
+                            detections.append((x1i, y1i, x2i, y2i, float(conf), class_name))
+
+                person_candidates = [d for d in detections if d[5] == "person"]
+                ultrasonic_distance_cm = motion.get_ultrasonic_distance_cm()
+
+                target_detection = None
+                target_bbox_for_frame = None
+                now = time.time()
+
+                if active_target_id is None and now >= reacquire_block_until and person_candidates:
+                    target_detection = select_loneliest_person(person_candidates)
+                    target_bbox_for_frame = (
+                        target_detection[0],
+                        target_detection[1],
+                        target_detection[2],
+                        target_detection[3],
+                    )
+                    active_target_id = next_target_id
+                    next_target_id += 1
+                    active_target_bbox = target_bbox_for_frame
+                    target_miss_count = 0
+                elif active_target_id is not None and active_target_bbox is not None and person_candidates:
+                    best = max(
+                        person_candidates,
+                        key=lambda d: bbox_iou(active_target_bbox, (d[0], d[1], d[2], d[3])),
+                    )
+                    best_iou = bbox_iou(active_target_bbox, (best[0], best[1], best[2], best[3]))
+                    if best_iou >= 0.15:
+                        smoothed = smooth_bbox(active_target_bbox, (best[0], best[1], best[2], best[3]), alpha=0.7)
+                        target_detection = (smoothed[0], smoothed[1], smoothed[2], smoothed[3], best[4], best[5])
+                        target_bbox_for_frame = smoothed
+                        active_target_bbox = smoothed
+                        target_miss_count = 0
+                    else:
+                        target_miss_count += 1
+                elif active_target_id is not None:
+                    target_miss_count += 1
+
+                if active_target_id is not None and target_miss_count > max_target_miss_frames:
+                    active_target_id = None
+                    active_target_bbox = None
+                    target_miss_count = 0
+                    time.sleep(0.5)
+                    # motion.send_motion_command("W", cooldown_s=1)
+
+                if active_target_id is None:
+                    motion.send_motion_command("W", cooldown_s=0.5)
+
+                for _, (x1, y1, x2, y2, p_conf, class_name) in enumerate(detections):
+                    if class_name != "person":
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (220, 140, 0), 2)
+                        cv2.putText(
+                            frame,
+                            f"{class_name} {p_conf:.2f}",
+                            (x1, max(20, y1 - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55,
+                            (220, 140, 0),
+                            2,
+                            cv2.LINE_AA,
+                        )
+                        continue
+
+                    if target_bbox_for_frame is None:
+                        is_target = False
+                    else:
+                        is_target = bbox_iou((x1, y1, x2, y2), target_bbox_for_frame) >= 0.25
+
+                    if not is_target:
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (180, 180, 180), 2)
+                        cv2.putText(
+                            frame,
+                            f"{class_name} {p_conf:.2f} | non-target",
+                            (x1, max(20, y1 - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55,
+                            (180, 180, 180),
+                            2,
+                            cv2.LINE_AA,
+                        )
+                        continue
+
+                    person_roi = frame[y1:y2, x1:x2]
+                    if person_roi.size == 0:
+                        continue
+
+                    if not reached_person(
+                        (x1, y1, x2, y2),
+                        (h, w),
+                        ultrasonic_distance_cm=ultrasonic_distance_cm,
+                    ):
+                        robot_direction = go_to_person(
+                            motion, active_target_id, (x1, y1, x2, y2), (h, w)
+                        )
+                        robot_state = "moving_towards_target"
+                        box_color = (255, 180, 0)
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+                        cv2.putText(
+                            frame,
+                            f"target {p_conf:.2f} | approaching",
+                            (x1, max(20, y1 - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55,
+                            box_color,
+                            2,
+                            cv2.LINE_AA,
+                        )
+                        continue
+
+                    motion.send_motion_command("S", cooldown_s=0.2)
+                    robot_state = "target_reached"
+                    robot_direction = "none"
+                    target_reached_hold_until = time.time() + 2.0
+                    speak_pickup_invite(web)
+                    emotion_label, emotion_conf, box_color, conversation_hold_s = detect_emotion(
+                        active_target_id,
+                        person_roi,
+                        image_processor,
+                        emotion_model,
+                        id2label,
+                        conversation_history,
+                        web,
+                        trigger_conversation=False,
+                    )
+                    mood = "happy" if emotion_label == "happy" else "sad"
+                    timed_conversation_lines = (
+                        get_emotion_turn_script(mood) if get_emotion_turn_script is not None else []
+                    )
+                    timed_conversation_active = len(timed_conversation_lines) > 0
+                    timed_conversation_idx = 0
+                    timed_conversation_next_at = time.time() + AUDIO_TURN_DELAY_S
+                    web.set_last_emotion(f"{emotion_label} ({emotion_conf:.2f})")
+                    print(f"[emotion] label={emotion_label} conf={emotion_conf:.2f}")
+                    web.set_conversation_mood(mood)
+
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+                    label = f"target {p_conf:.2f} | {emotion_label} {emotion_conf:.2f}"
+>>>>>>> Stashed changes
                     cv2.putText(
                         frame,
                         f"{class_name} {p_conf:.2f}",
