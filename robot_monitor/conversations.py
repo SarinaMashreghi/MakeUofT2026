@@ -104,8 +104,8 @@ HAPPY_DEMO_SCRIPTS = [
 
 SAD_DEMO_SCRIPTS = [
     (
-        "Would you like a kind compliment or a short calming breathing pause? "
-        "Thank you for sharing. "
+        "Here is a kind compliment: your presence makes this space feel warmer. "
+        "Take a short calming breath with me. "
         "Here is a soft Valentine fun fact: the first heart-shaped chocolate box was introduced in the 1800s. "
         f"{CANDY_CLOSING_LINE}"
     ),

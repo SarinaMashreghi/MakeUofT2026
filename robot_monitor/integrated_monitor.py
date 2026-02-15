@@ -1,4 +1,5 @@
 import time
+import socket
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -27,7 +28,7 @@ INVITE_REPEAT_INTERVAL_S = 10.0
 INVITE_MAX_PLAYS = 2
 USER_REPLY_GRACE_S = 12.0
 POST_REPLY_CONVERSATION_HOLD_S = 15.0
-AUDIO_TURN_DELAY_S = 12.0
+AUDIO_TURN_DELAY_S = 5.0
 RUNTIME_ERROR_LOG = "runtime_errors.log"
 
 
@@ -39,6 +40,15 @@ def persist_fatal_error(base_dir: Path, message: str) -> None:
             f.write(f"[{ts}] {message}\n")
     except Exception as e:
         print(f"WARN: Could not write fatal error log: {e}")
+
+
+def get_local_ip() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
 
 
 def on_happy_detected(
@@ -348,7 +358,9 @@ def main() -> None:
         esp_error=motion.get_last_error(),
     )
     
-    print(f"Web UI: http://localhost:{web_port}")
+    local_ip = get_local_ip()
+    print(f"Web UI (local): http://localhost:{web_port}")
+    print(f"Web UI (LAN):   http://{local_ip}:{web_port}")
     print("Loading models...")
 
     person_detector = YOLO(yolo_model_path)
@@ -523,10 +535,12 @@ def main() -> None:
                     active_target_id = None
                     active_target_bbox = None
                     target_miss_count = 0
-                    motion.send_motion_command("W", cooldown_s=0.5)
+                    time.sleep(0.5)
+                    # motion.send_motion_command("W", cooldown_s=0.5)
 
                 if active_target_id is None:
-                    motion.send_motion_command("W", cooldown_s=0.5)
+                    time.sleep(0.5)
+                    # motion.send_motion_command("W", cooldown_s=0.5)
 
                 for _, (x1, y1, x2, y2, p_conf, class_name) in enumerate(detections):
                     if class_name != "person":
