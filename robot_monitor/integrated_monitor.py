@@ -7,17 +7,90 @@ import torch
 from transformers import AutoImageProcessor, AutoModelForImageClassification
 from ultralytics import YOLO
 
+try:
+    from conversations import machine_conversation_turn
+    from conversations import fixed_phrase_tts
+except BaseException as e:  # pragma: no cover - runtime dependency guard
+    machine_conversation_turn = None
+    fixed_phrase_tts = None
+    print(f"WARN: conversations module unavailable: {e}")
+
 from io_control import ESPMotionController, WebStreamer
 
+PICKUP_INVITE_PHRASE = "Hello, I'm cupid bot, please pick me up if you want company."
+INVITE_REPEAT_INTERVAL_S = 10.0
+INVITE_MIN_PLAYS = 3
+POST_REPLY_CONVERSATION_HOLD_S = 6.0
 
-def on_happy_detected(person_id: int, emotion: str, confidence: float) -> None:
-    """TODO: Add robot/audio behavior for happy emotion."""
-    pass
+
+def on_happy_detected(
+    person_id: int,
+    emotion: str,
+    confidence: float,
+    conversation_history: List[str],
+    web: WebStreamer,
+) -> float:
+    del person_id, emotion, confidence
+    if machine_conversation_turn is None:
+        return 0.0
+
+    try:
+        assistant_text, audio_url, next_history = machine_conversation_turn(
+            mood="happy",
+            history=conversation_history,
+            user_text="Start with a warm, playful greeting and ask one fun short question.",
+        )
+        conversation_history[:] = next_history
+        web.publish_audio(text=assistant_text, audio_url=audio_url, kind="conversation_happy")
+        print(f"[conversation/happy] {assistant_text}")
+        print(f"[conversation/happy] audio: {audio_url}")
+        return 6.0
+    except Exception as e:
+        print(f"WARN: Happy conversation failed: {e}")
+        return 0.0
 
 
-def on_sad_detected(person_id: int, emotion: str, confidence: float) -> None:
-    """TODO: Add robot/audio behavior for non-happy emotion (treated as sad)."""
-    pass
+def on_sad_detected(
+    person_id: int,
+    emotion: str,
+    confidence: float,
+    conversation_history: List[str],
+    web: WebStreamer,
+) -> float:
+    del person_id, emotion, confidence
+    if machine_conversation_turn is None:
+        return 0.0
+
+    try:
+        assistant_text, audio_url, next_history = machine_conversation_turn(
+            mood="sad",
+            history=conversation_history,
+            user_text="Start with a gentle check-in and one optional low-pressure suggestion.",
+        )
+        conversation_history[:] = next_history
+        web.publish_audio(text=assistant_text, audio_url=audio_url, kind="conversation_sad")
+        print(f"[conversation/sad] {assistant_text}")
+        print(f"[conversation/sad] audio: {audio_url}")
+        return 6.0
+    except Exception as e:
+        print(f"WARN: Sad conversation failed: {e}")
+        return 0.0
+
+
+def speak_pickup_invite(web: WebStreamer) -> float:
+    if fixed_phrase_tts is None:
+        return 0.0
+    try:
+        spoken_text, audio_url = fixed_phrase_tts(
+            phrase=PICKUP_INVITE_PHRASE,
+            cache_key="pickup_invite_cupid_bot",
+        )
+        web.publish_audio(text=spoken_text, audio_url=audio_url, kind="pickup_invite")
+        print(f"[pickup-invite] audio: {audio_url}")
+        return 0.0
+    except Exception as e:
+        print(f"WARN: Fixed pickup invite TTS failed: {e}")
+        return 0.0
 
 
 def classify_person_emotion(
@@ -208,27 +281,38 @@ def detect_emotion(
     image_processor: AutoImageProcessor,
     emotion_model: AutoModelForImageClassification,
     id2label: Dict[int, str],
-) -> Tuple[str, float, Tuple[int, int, int]]:
+    conversation_history: List[str],
+    web: WebStreamer,
+    trigger_conversation: bool = True,
+) -> Tuple[str, float, Tuple[int, int, int], float]:
     emotion_label, emotion_conf = classify_person_emotion(
         person_roi, image_processor, emotion_model, id2label
     )
 
     if emotion_label == "happy":
-        on_happy_detected(person_id, emotion_label, emotion_conf)
-        return emotion_label, emotion_conf, (0, 220, 0)
+        hold_s = 0.0
+        if trigger_conversation:
+            hold_s = on_happy_detected(
+                person_id, emotion_label, emotion_conf, conversation_history, web
+            )
+        return emotion_label, emotion_conf, (0, 220, 0), hold_s
 
-    on_sad_detected(person_id, emotion_label, emotion_conf)
-    return emotion_label, emotion_conf, (0, 80, 255)
+    hold_s = 0.0
+    if trigger_conversation:
+        hold_s = on_sad_detected(
+            person_id, emotion_label, emotion_conf, conversation_history, web
+        )
+    return emotion_label, emotion_conf, (0, 80, 255), hold_s
 
 
 def main() -> None:
-    webcam_index = 1
+    webcam_index = 0
     yolo_model_path = "./models/yolov8n.pt"
     emotion_model_dir = "./models/hugging_face_vit"
     yolo_conf = 0.50
     imgsz = 416
     web_host = "0.0.0.0"
-    web_port = 5000
+    web_port = 5005
     stream_width = 600
     stream_height = 360
 
@@ -272,6 +356,12 @@ def main() -> None:
     max_target_miss_frames = 12
     reacquire_block_until = 0.0
     target_reached_hold_until = 0.0
+    conversation_busy_until = 0.0
+    invite_active = False
+    invite_play_count = 0
+    invite_next_play_at = 0.0
+    invite_reply_received = False
+    conversation_history: List[str] = []
 
     web.set_processing_started(True)
 
@@ -289,6 +379,109 @@ def main() -> None:
             frame = cv2.flip(frame, 1)
             h, w = frame.shape[:2]
             detections: List[Tuple[int, int, int, int, float, str]] = []
+            now = time.time()
+
+            if now < conversation_busy_until:
+                active_target_id = None
+                active_target_bbox = None
+                target_miss_count = 0
+                motion.send_motion_command("S", cooldown_s=0.3)
+                robot_state = "conversation_ongoing"
+                cv2.putText(
+                    frame,
+                    "Conversation ongoing...",
+                    (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (255, 200, 200),
+                    2,
+                    cv2.LINE_AA,
+                )
+                dt = time.time() - t0
+                fps = (frame_idx + 1) / dt if dt > 0 else 0.0
+                cv2.putText(
+                    frame,
+                    f"FPS: {fps:.1f} | Persons: {len(detections)}",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+                web.set_runtime_state(
+                    robot_state=robot_state,
+                    robot_direction=robot_direction,
+                    esp_connected=motion.is_connected(),
+                    esp_error=motion.get_last_error(),
+                )
+                stream_frame = cv2.resize(frame, (stream_width, stream_height), interpolation=cv2.INTER_AREA)
+                web.publish_frame(stream_frame)
+                frame_idx += 1
+                continue
+
+            if invite_active:
+                active_target_id = None
+                active_target_bbox = None
+                target_miss_count = 0
+                motion.send_motion_command("S", cooldown_s=0.3)
+                robot_state = "awaiting_user_reply"
+
+                if web.consume_conversation_started():
+                    invite_reply_received = True
+
+                should_repeat_invite = now >= invite_next_play_at and (
+                    invite_play_count < INVITE_MIN_PLAYS or not invite_reply_received
+                )
+                if should_repeat_invite:
+                    speak_pickup_invite(web)
+                    invite_play_count += 1
+                    invite_next_play_at = time.time() + INVITE_REPEAT_INTERVAL_S
+
+                if invite_reply_received and invite_play_count >= INVITE_MIN_PLAYS:
+                    invite_active = False
+                    invite_play_count = 0
+                    invite_next_play_at = 0.0
+                    invite_reply_received = False
+                    conversation_busy_until = time.time() + POST_REPLY_CONVERSATION_HOLD_S
+                    robot_state = "conversation_ongoing"
+
+                cv2.putText(
+                    frame,
+                    (
+                        "Conversation started. Paused..."
+                        if robot_state == "conversation_ongoing"
+                        else f"Awaiting user reply... invite #{invite_play_count}"
+                    ),
+                    (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (255, 200, 200),
+                    2,
+                    cv2.LINE_AA,
+                )
+                dt = time.time() - t0
+                fps = (frame_idx + 1) / dt if dt > 0 else 0.0
+                cv2.putText(
+                    frame,
+                    f"FPS: {fps:.1f} | Persons: {len(detections)}",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+                web.set_runtime_state(
+                    robot_state=robot_state,
+                    robot_direction=robot_direction,
+                    esp_connected=motion.is_connected(),
+                    esp_error=motion.get_last_error(),
+                )
+                stream_frame = cv2.resize(frame, (stream_width, stream_height), interpolation=cv2.INTER_AREA)
+                web.publish_frame(stream_frame)
+                frame_idx += 1
+                continue
 
             try:
                 yolo_results = person_detector.predict(
@@ -426,9 +619,24 @@ def main() -> None:
                     robot_state = "target_reached"
                     robot_direction = "none"
                     target_reached_hold_until = time.time() + 2.0
-                    emotion_label, emotion_conf, box_color = detect_emotion(
-                        active_target_id, person_roi, image_processor, emotion_model, id2label
+                    invite_active = True
+                    invite_play_count = 1
+                    invite_next_play_at = time.time() + INVITE_REPEAT_INTERVAL_S
+                    invite_reply_received = False
+                    speak_pickup_invite(web)
+                    emotion_label, emotion_conf, box_color, conversation_hold_s = detect_emotion(
+                        active_target_id,
+                        person_roi,
+                        image_processor,
+                        emotion_model,
+                        id2label,
+                        conversation_history,
+                        web,
+                        trigger_conversation=False,
                     )
+                    web.set_conversation_mood("happy" if emotion_label == "happy" else "sad")
+                    if conversation_hold_s > 0:
+                        conversation_busy_until = time.time() + conversation_hold_s
 
                     cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
                     label = f"target {p_conf:.2f} | {emotion_label} {emotion_conf:.2f}"
@@ -447,7 +655,7 @@ def main() -> None:
                     active_target_bbox = None
                     target_miss_count = 0
                     reacquire_block_until = time.time() + 1.0
-                    motion.send_motion_command("W", cooldown_s=0.2)
+                    motion.send_motion_command("S", cooldown_s=0.2)
                     break
 
             except Exception as e:
@@ -478,12 +686,16 @@ def main() -> None:
                 cv2.LINE_AA,
             )
 
+            display_state = robot_state
+            if (
+                not invite_active
+                and robot_state != "moving_towards_target"
+                and time.time() < target_reached_hold_until
+            ):
+                display_state = "target_reached"
+
             web.set_runtime_state(
-                robot_state=(
-                    "target_reached"
-                    if (robot_state != "moving_towards_target" and time.time() < target_reached_hold_until)
-                    else robot_state
-                ),
+                robot_state=display_state,
                 robot_direction=robot_direction,
                 esp_connected=motion.is_connected(),
                 esp_error=motion.get_last_error(),
