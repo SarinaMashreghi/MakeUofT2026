@@ -1,33 +1,14 @@
 import time
-import serial
-import threading
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 import cv2
 import torch
-from flask import Flask, Response, jsonify, render_template
 from transformers import AutoImageProcessor, AutoModelForImageClassification
 from ultralytics import YOLO
 
-ESP = None
-try:
-    ESP = serial.Serial("COM3", 115200, timeout=0.1, write_timeout=0.05)
-    time.sleep(2)
-    print("Connected to ESP32 on COM3")
-except Exception as e:
-    print(f"WARN: Could not connect to ESP32 on COM3: {e}")
-    print("Running in camera/web-only mode.")
+from io_control import ESPMotionController, WebStreamer
 
-# Motion-control state to reduce jitter and command spam
-_LAST_CMD = "S"
-_LAST_CMD_TS = 0.0
-_LATEST_JPEG = None
-_FRAME_LOCK = threading.Lock()
-_FRAME_COND = threading.Condition(_FRAME_LOCK)
-_LATEST_FRAME_ID = 0
-_FRAME_COUNT = 0
-_PROCESSING_STARTED = False
 
 def on_happy_detected(person_id: int, emotion: str, confidence: float) -> None:
     """TODO: Add robot/audio behavior for happy emotion."""
@@ -56,100 +37,7 @@ def classify_person_emotion(
     return label, conf
 
 
-def send_motion_command(cmd: str, cooldown_s: float) -> None:
-    """Send motion command with cooldown and duplicate suppression."""
-    global _LAST_CMD, _LAST_CMD_TS, ESP
-    now = time.time()
-    if cmd == _LAST_CMD and (now - _LAST_CMD_TS) < cooldown_s:
-        return
-    
-    print("sending motion", cmd)
-    if ESP is not None:
-        try:
-            ESP.write(cmd.encode())
-        except Exception as e:
-            # Prevent serial issues from stalling the vision/web loop.
-            print(f"WARN: ESP write failed, disabling serial output: {e}")
-            try:
-                ESP.close()
-            except Exception:
-                pass
-            ESP = None
-    _LAST_CMD = cmd
-    _LAST_CMD_TS = now
-
-
-def get_ultrasonic_distance_cm() -> float | None:
-    """TODO: Parse ultrasonic distance from ESP serial and return cm."""
-    return None
-
-
-BASE_DIR = Path(__file__).resolve().parent
-WEB_DIR = BASE_DIR / "web"
-app = Flask(
-    __name__,
-    template_folder=str(WEB_DIR / "templates"),
-    static_folder=str(WEB_DIR / "static"),
-)
-
-
-@app.get("/")
-def index() -> str:
-    return render_template("index.html")
-
-
-def _mjpeg_generator():
-    last_sent_id = -1
-    while True:
-        with _FRAME_COND:
-            # Wait until a new frame is published.
-            while _LATEST_JPEG is None or _LATEST_FRAME_ID == last_sent_id:
-                _FRAME_COND.wait(timeout=0.5)
-            frame = _LATEST_JPEG
-            last_sent_id = _LATEST_FRAME_ID
-        yield (b"--frame\r\n"
-               b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
-
-
-@app.get("/video_feed")
-def video_feed():
-    resp = Response(_mjpeg_generator(), mimetype="multipart/x-mixed-replace; boundary=frame")
-    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-    resp.headers["Pragma"] = "no-cache"
-    return resp
-
-
-@app.get("/status")
-def status():
-    with _FRAME_LOCK:
-        has_frame = _LATEST_JPEG is not None
-    return jsonify(
-        {
-            "streaming": has_frame,
-            "processing_started": _PROCESSING_STARTED,
-            "frame_count": _FRAME_COUNT,
-        }
-    )
-
-
-def publish_frame(frame_bgr) -> None:
-    global _LATEST_JPEG, _FRAME_COUNT, _LATEST_FRAME_ID
-    ok, encoded = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 65])
-    if not ok:
-        return
-    with _FRAME_COND:
-        _LATEST_JPEG = encoded.tobytes()
-        _LATEST_FRAME_ID += 1
-        _FRAME_COND.notify_all()
-    _FRAME_COUNT += 1
-
-
-def run_web_server(host: str = "0.0.0.0", port: int = 5000) -> None:
-    app.run(host=host, port=port, debug=False, use_reloader=False, threaded=True)
-
-
 def open_camera_with_fallback(preferred_index: int):
-    # Windows webcams often vary by backend; validate by reading a frame.
     trial_indices = [preferred_index, 0, 1, 2]
     seen = set()
     ordered_indices = []
@@ -166,7 +54,6 @@ def open_camera_with_fallback(preferred_index: int):
                 cap.release()
                 continue
 
-            # Give backend a short warm-up and verify we can actually read frames.
             ok = False
             for _ in range(20):
                 read_ok, test_frame = cap.read()
@@ -207,7 +94,6 @@ def smooth_bbox(
     curr_bbox: Tuple[int, int, int, int],
     alpha: float = 0.7,
 ) -> Tuple[int, int, int, int]:
-    """Exponential smoothing to reduce per-frame bbox jitter."""
     if prev_bbox is None:
         return curr_bbox
     px1, py1, px2, py2 = prev_bbox
@@ -219,42 +105,76 @@ def smooth_bbox(
     return x1, y1, x2, y2
 
 
-def go_to_person(person_id: int, bbox: Tuple[int, int, int, int], frame_shape: Tuple[int, int]) -> None:
-    """Orient robot toward person center and move forward when centered."""
-    del person_id  # reserved for future multi-target tracking
+def bbox_center(bbox: Tuple[int, int, int, int]) -> Tuple[float, float]:
+    x1, y1, x2, y2 = bbox
+    return ((x1 + x2) * 0.5, (y1 + y2) * 0.5)
 
+
+def lonely_score(
+    candidate_bbox: Tuple[int, int, int, int],
+    all_bboxes: List[Tuple[int, int, int, int]],
+) -> float:
+    if len(all_bboxes) <= 1:
+        return float("inf")
+
+    cx, cy = bbox_center(candidate_bbox)
+    total = 0.0
+    count = 0
+    for other in all_bboxes:
+        if other == candidate_bbox:
+            continue
+        ox, oy = bbox_center(other)
+        dx = cx - ox
+        dy = cy - oy
+        total += (dx * dx + dy * dy) ** 0.5
+        count += 1
+    return total / max(1, count)
+
+
+def select_loneliest_person(
+    person_candidates: List[Tuple[int, int, int, int, float, str]]
+) -> Tuple[int, int, int, int, float, str]:
+    all_bboxes = [(p[0], p[1], p[2], p[3]) for p in person_candidates]
+    return max(
+        person_candidates,
+        key=lambda p: (
+            lonely_score((p[0], p[1], p[2], p[3]), all_bboxes),
+            (p[2] - p[0]) * (p[3] - p[1]),
+            p[4],
+        ),
+    )
+
+
+def go_to_person(
+    motion: ESPMotionController,
+    person_id: int,
+    bbox: Tuple[int, int, int, int],
+    frame_shape: Tuple[int, int],
+) -> str:
+    del person_id
     x1, y1, x2, y2 = bbox
     frame_h, frame_w = frame_shape
     del frame_h
 
     cx = (x1 + x2) * 0.5
     mx = frame_w * 0.5
-    e = (cx - mx) / max(1.0, mx)  # normalized center error in [-1, 1]
+    e = (cx - mx) / max(1.0, mx)
     abs_e = abs(e)
 
-    # Hysteresis-style thresholds reduce oscillation.
     deadband = 0.10
     enter_turn = 0.18
     strong_turn = 0.45
 
-    if abs_e <= deadband:
-        send_motion_command("F", cooldown_s=0.5)
-        return
-
-    if abs_e < enter_turn:
-        send_motion_command("F", cooldown_s=0.5)
-        return
+    if abs_e <= deadband or abs_e < enter_turn:
+        motion.send_motion_command("F", cooldown_s=0.5)
+        return "forward"
 
     if e < 0:
-        if abs_e >= strong_turn:
-            send_motion_command("L", cooldown_s=0.5)
-        else:
-            send_motion_command("L", cooldown_s=1)
+        motion.send_motion_command("L", cooldown_s=0.5 if abs_e >= strong_turn else 1.0)
+        return "left"
     else:
-        if abs_e >= strong_turn:
-            send_motion_command("R", cooldown_s=0.5)
-        else:
-            send_motion_command("R", cooldown_s=1)
+        motion.send_motion_command("R", cooldown_s=0.5 if abs_e >= strong_turn else 1.0)
+        return "right"
 
 
 def reached_person(
@@ -264,7 +184,6 @@ def reached_person(
     ultrasonic_distance_cm: float | None = None,
     ultrasonic_threshold_cm: float = 45.0,
 ) -> bool:
-    """Return True when vision OR ultrasonic says robot is close enough."""
     x1, y1, x2, y2 = bbox
     frame_h, frame_w = frame_shape
     box_area = max(0, x2 - x1) * max(0, y2 - y1)
@@ -275,7 +194,12 @@ def reached_person(
     if ultrasonic_distance_cm is not None and ultrasonic_distance_cm > 0:
         ultrasonic_close = ultrasonic_distance_cm <= ultrasonic_threshold_cm
 
-    return vision_close or ultrasonic_close
+    reached_target = vision_close or ultrasonic_close
+    
+    if(reached_target):
+        print("reached target")
+        
+    return reached_target
 
 
 def detect_emotion(
@@ -285,7 +209,6 @@ def detect_emotion(
     emotion_model: AutoModelForImageClassification,
     id2label: Dict[int, str],
 ) -> Tuple[str, float, Tuple[int, int, int]]:
-    """Classify emotion for a person ROI and trigger happy/sad callbacks."""
     emotion_label, emotion_conf = classify_person_emotion(
         person_roi, image_processor, emotion_model, id2label
     )
@@ -299,8 +222,6 @@ def detect_emotion(
 
 
 def main() -> None:
-    global _PROCESSING_STARTED
-    # ---- Config ----
     webcam_index = 1
     yolo_model_path = "./models/yolov8n.pt"
     emotion_model_dir = "./models/hugging_face_vit"
@@ -308,20 +229,23 @@ def main() -> None:
     imgsz = 416
     web_host = "0.0.0.0"
     web_port = 5000
-    stream_width = 640
+    stream_width = 600
     stream_height = 360
-    # --------------
 
-    server_thread = threading.Thread(
-        target=run_web_server, args=(web_host, web_port), daemon=True
+    motion = ESPMotionController(port="COM3")
+    web = WebStreamer(base_dir=Path(__file__).resolve().parent)
+    web.start_in_thread(host=web_host, port=web_port)
+    web.set_runtime_state(
+        robot_state="idle",
+        robot_direction="none",
+        esp_connected=motion.is_connected(),
+        esp_error=motion.get_last_error(),
     )
-    server_thread.start()
+    
     print(f"Web UI: http://localhost:{web_port}")
     print("Loading models...")
 
     person_detector = YOLO(yolo_model_path)
-
-    # Load locally exported HF emotion model + processor
     image_processor = AutoImageProcessor.from_pretrained(emotion_model_dir, use_fast=False)
     emotion_model = AutoModelForImageClassification.from_pretrained(emotion_model_dir)
     emotion_model.eval()
@@ -347,10 +271,14 @@ def main() -> None:
     target_miss_count = 0
     max_target_miss_frames = 12
     reacquire_block_until = 0.0
+    target_reached_hold_until = 0.0
 
-    _PROCESSING_STARTED = True
+    web.set_processing_started(True)
+
     try:
         while True:
+            robot_state = "idle"
+            robot_direction = "none"
             ok, frame = cap.read()
             if not ok or frame is None:
                 if frame_idx % 30 == 0:
@@ -359,7 +287,6 @@ def main() -> None:
                 continue
 
             frame = cv2.flip(frame, 1)
-            print("frame received")
             h, w = frame.shape[:2]
             detections: List[Tuple[int, int, int, int, float, str]] = []
 
@@ -390,29 +317,14 @@ def main() -> None:
                             detections.append((x1i, y1i, x2i, y2i, float(conf), class_name))
 
                 person_candidates = [d for d in detections if d[5] == "person"]
-                ultrasonic_distance_cm = get_ultrasonic_distance_cm()
+                ultrasonic_distance_cm = motion.get_ultrasonic_distance_cm()
 
                 target_detection = None
                 target_bbox_for_frame = None
                 now = time.time()
 
-                # Fast path: if there is exactly one person, it is always the target.
-                if len(person_candidates) == 1:
-                    only = person_candidates[0]
-                    target_detection = only
-                    target_bbox_for_frame = (only[0], only[1], only[2], only[3])
-                    if active_target_id is None and now >= reacquire_block_until:
-                        active_target_id = next_target_id
-                        next_target_id += 1
-                    active_target_bbox = target_bbox_for_frame
-                    target_miss_count = 0
-
-                # Acquire a target once (pick largest person) when unlocked.
-                elif active_target_id is None and now >= reacquire_block_until and person_candidates:
-                    target_detection = max(
-                        person_candidates,
-                        key=lambda d: (d[2] - d[0]) * (d[3] - d[1]),
-                    )
+                if active_target_id is None and now >= reacquire_block_until and person_candidates:
+                    target_detection = select_loneliest_person(person_candidates)
                     target_bbox_for_frame = (
                         target_detection[0],
                         target_detection[1],
@@ -421,10 +333,9 @@ def main() -> None:
                     )
                     active_target_id = next_target_id
                     next_target_id += 1
-                    active_target_bbox = (target_detection[0], target_detection[1], target_detection[2], target_detection[3])
+                    active_target_bbox = target_bbox_for_frame
                     target_miss_count = 0
                 elif active_target_id is not None and active_target_bbox is not None and person_candidates:
-                    # Keep following the same target by IoU matching.
                     best = max(
                         person_candidates,
                         key=lambda d: bbox_iou(active_target_bbox, (d[0], d[1], d[2], d[3])),
@@ -445,10 +356,10 @@ def main() -> None:
                     active_target_id = None
                     active_target_bbox = None
                     target_miss_count = 0
-                    send_motion_command("W", cooldown_s=0.5)
+                    motion.send_motion_command("W", cooldown_s=0.5)
 
                 if active_target_id is None:
-                    send_motion_command("W", cooldown_s=0.5)
+                    motion.send_motion_command("W", cooldown_s=0.5)
 
                 for _, (x1, y1, x2, y2, p_conf, class_name) in enumerate(detections):
                     if class_name != "person":
@@ -468,10 +379,7 @@ def main() -> None:
                     if target_bbox_for_frame is None:
                         is_target = False
                     else:
-                        is_target = bbox_iou(
-                            (x1, y1, x2, y2),
-                            target_bbox_for_frame,
-                        ) >= 0.25
+                        is_target = bbox_iou((x1, y1, x2, y2), target_bbox_for_frame) >= 0.25
 
                     if not is_target:
                         cv2.rectangle(frame, (x1, y1), (x2, y2), (180, 180, 180), 2)
@@ -496,7 +404,10 @@ def main() -> None:
                         (h, w),
                         ultrasonic_distance_cm=ultrasonic_distance_cm,
                     ):
-                        go_to_person(active_target_id, (x1, y1, x2, y2), (h, w))
+                        robot_direction = go_to_person(
+                            motion, active_target_id, (x1, y1, x2, y2), (h, w)
+                        )
+                        robot_state = "moving_towards_target"
                         box_color = (255, 180, 0)
                         cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
                         cv2.putText(
@@ -511,13 +422,15 @@ def main() -> None:
                         )
                         continue
 
-                    send_motion_command("S", cooldown_s=0.2)
+                    motion.send_motion_command("S", cooldown_s=0.2)
+                    robot_state = "target_reached"
+                    robot_direction = "none"
+                    target_reached_hold_until = time.time() + 2.0
                     emotion_label, emotion_conf, box_color = detect_emotion(
                         active_target_id, person_roi, image_processor, emotion_model, id2label
                     )
 
                     cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
-                    label = f"{class_name}#{active_target_id} {p_conf:.2f} | {emotion_label} {emotion_conf:.2f}"
                     label = f"target {p_conf:.2f} | {emotion_label} {emotion_conf:.2f}"
                     cv2.putText(
                         frame,
@@ -529,12 +442,12 @@ def main() -> None:
                         2,
                         cv2.LINE_AA,
                     )
-                    # Target reached and processed; reset to waiting.
+
                     active_target_id = None
                     active_target_bbox = None
                     target_miss_count = 0
                     reacquire_block_until = time.time() + 1.0
-                    send_motion_command("W", cooldown_s=0.2)
+                    motion.send_motion_command("W", cooldown_s=0.2)
                     break
 
             except Exception as e:
@@ -549,6 +462,8 @@ def main() -> None:
                     2,
                     cv2.LINE_AA,
                 )
+                robot_state = "idle"
+                robot_direction = "none"
 
             dt = time.time() - t0
             fps = (frame_idx + 1) / dt if dt > 0 else 0.0
@@ -563,12 +478,18 @@ def main() -> None:
                 cv2.LINE_AA,
             )
 
-            stream_frame = cv2.resize(
-                frame,
-                (stream_width, stream_height),
-                interpolation=cv2.INTER_AREA,
+            web.set_runtime_state(
+                robot_state=(
+                    "target_reached"
+                    if (robot_state != "moving_towards_target" and time.time() < target_reached_hold_until)
+                    else robot_state
+                ),
+                robot_direction=robot_direction,
+                esp_connected=motion.is_connected(),
+                esp_error=motion.get_last_error(),
             )
-            publish_frame(stream_frame)
+            stream_frame = cv2.resize(frame, (stream_width, stream_height), interpolation=cv2.INTER_AREA)
+            web.publish_frame(stream_frame)
 
             frame_idx += 1
             if frame_idx % 30 == 0:
@@ -576,6 +497,7 @@ def main() -> None:
 
     finally:
         cap.release()
+        motion.close()
 
 
 if __name__ == "__main__":

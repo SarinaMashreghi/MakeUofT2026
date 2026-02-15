@@ -3,37 +3,139 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Robot Monitor</title>
+    <title>Cupid Bot</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            colors: {
+              blush: "#fff1f2",
+              rosepastel: "#fecdd3",
+              softpink: "#f9a8d4",
+              cupidred: "#e11d48",
+              deepberry: "#9f1239"
+            }
+          }
+        }
+      };
+    </script>
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
   </head>
-  <body>
-    <main class="wrap">
-      <h1>Robot Monitor Feed</h1>
-      <p class="hint">Live stream from <code>/video_feed</code></p>
-      <img id="feed" src="/video_feed" alt="Robot camera feed" />
-      <p id="status" class="status">Connecting...</p>
+  <body class="min-h-screen bg-gradient-to-b from-blush via-white to-rosepastel text-deepberry">
+    <main class="relative isolate overflow-hidden min-h-screen">
+      <div class="absolute inset-0 -z-10">
+        <div class="absolute left-1/2 top-0 h-72 w-72 -translate-x-1/2 rounded-full bg-softpink/40 blur-3xl"></div>
+        <div class="absolute -left-16 top-36 h-72 w-72 rounded-full bg-rose-200/50 blur-3xl"></div>
+        <div class="absolute right-0 top-56 h-72 w-72 rounded-full bg-red-200/50 blur-3xl"></div>
+      </div>
+
+      <section class="mx-auto flex w-full max-w-7xl items-center px-4 py-12 sm:px-8 lg:py-20">
+        <div class="grid w-full gap-8 lg:grid-cols-2 lg:gap-12">
+          <div class="order-2 lg:order-1">
+            <div class="overflow-hidden rounded-3xl border border-rose-200/80 bg-white/70 shadow-2xl shadow-rose-200/60 backdrop-blur">
+              <div class="flex items-center justify-between border-b border-rose-200 bg-rose-50/80 px-4 py-3">
+                <span class="text-sm font-semibold text-rose-700">Cupid Bot Camera</span>
+                <span aria-hidden="true" class="text-base text-rose-500">&#10084;</span>
+              </div>
+              <img id="feed" src="/video_feed" alt="Robot camera feed" class="w-full" />
+            </div>
+          </div>
+
+          <aside class="order-1 flex flex-col justify-center lg:order-2">
+            <header class="mb-6 text-center lg:text-left">
+              <div class="flex items-center justify-center gap-3 lg:justify-start">
+                <img
+                  src="https://img.icons8.com/?size=100&id=114073&format=png&color=9f1239"
+                  alt="Valentine heart icon"
+                  class="h-10 w-10"
+                />
+                <h1 class="text-4xl font-bold tracking-tight sm:text-5xl">Cupid Bot</h1>
+              </div>
+              
+            </header>
+
+            <div class="mb-4 rounded-2xl border border-rose-200 bg-white/85 p-4 shadow-md shadow-rose-100">
+              <p class="text-sm font-semibold uppercase tracking-wide text-rose-700">Robot Status</p>
+              <p id="robot-status" class="mt-2 text-lg font-bold text-rose-800">No target in range, searching</p>
+              <p id="stream-status" class="mt-1 text-sm text-rose-700">Connecting to video stream...</p>
+            </div>
+
+            <details id="esp-warning" class="rounded-2xl border border-red-200 bg-red-50/80 p-4 text-red-900 open:shadow-md" open>
+              <summary class="cursor-pointer list-none font-semibold">
+                Something is wrong with ESP32 connection
+              </summary>
+              <p id="esp-warning-detail" class="mt-3 text-sm text-red-800">
+                Waiting for detailed error...
+              </p>
+            </details>
+
+            <div id="esp-ok" class="hidden items-center justify-center gap-2 rounded-2xl border border-rose-200 bg-white/80 px-4 py-3 text-sm font-medium text-rose-800 shadow-md shadow-rose-100 sm:text-base lg:justify-start">
+              <span aria-hidden="true">&#10084;</span>
+              <p class="status">ESP32 connection healthy.</p>
+              <span aria-hidden="true">&#10084;</span>
+            </div>
+          </aside>
+        </div>
+      </section>
     </main>
+
     <script>
-      const statusEl = document.getElementById("status");
+      const robotStatusEl = document.getElementById("robot-status");
+      const streamStatusEl = document.getElementById("stream-status");
       const feedEl = document.getElementById("feed");
+      const espWarningEl = document.getElementById("esp-warning");
+      const espWarningDetailEl = document.getElementById("esp-warning-detail");
+      const espOkEl = document.getElementById("esp-ok");
+
+      function formatRobotState(state, direction) {
+        if (state === "moving_towards_target") {
+          const allowed = new Set(["forward", "backward", "left", "right"]);
+          const dir = allowed.has(direction) ? direction : "forward";
+          return `Moving toward target (${dir})`;
+        }
+        if (state === "target_reached") return "Target reached";
+        return "No target in range, searching";
+      }
 
       feedEl.addEventListener("load", () => {
-        statusEl.textContent = "Streaming";
+        streamStatusEl.textContent = "Streaming";
       });
 
       feedEl.addEventListener("error", () => {
-        statusEl.textContent = "Feed error. Check /status and camera index.";
+        streamStatusEl.textContent = "Feed error. Check /status and camera index.";
       });
 
       async function pollStatus() {
         try {
           const res = await fetch("/status", { cache: "no-store" });
           const data = await res.json();
+
+          robotStatusEl.textContent = formatRobotState(data.robot_state, data.robot_direction);
+
           if (!data.streaming) {
-            statusEl.textContent = "Server up, waiting for first frame...";
+            streamStatusEl.textContent = "Server up, waiting for first frame...";
+          } else {
+            streamStatusEl.textContent = "Streaming";
+          }
+
+          if (data.esp_connected) {
+            espWarningEl.classList.add("hidden");
+            espOkEl.classList.remove("hidden");
+            espOkEl.classList.add("flex");
+          } else {
+            espWarningEl.classList.remove("hidden");
+            espOkEl.classList.add("hidden");
+            espOkEl.classList.remove("flex");
+            espWarningDetailEl.textContent = data.esp_error || "ESP32 connection failed for an unknown reason.";
           }
         } catch (_) {
-          statusEl.textContent = "Status endpoint unreachable.";
+          streamStatusEl.textContent = "Status endpoint unreachable.";
+          robotStatusEl.textContent = "No target in range, searching";
+          espWarningEl.classList.remove("hidden");
+          espWarningDetailEl.textContent = "Cannot reach /status endpoint.";
+          espOkEl.classList.add("hidden");
+          espOkEl.classList.remove("flex");
         }
       }
 
