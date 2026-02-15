@@ -5,13 +5,16 @@ from pathlib import Path
 
 import cv2
 import serial
-from flask import Flask, Response, jsonify, render_template, make_response
+from flask import Flask, Response, jsonify, render_template, make_response, send_file
+from werkzeug.serving import make_server
 
 try:
     from conversations import conversation_process, conversation_reset
+    conversation_import_error = ""
 except BaseException as e:  # pragma: no cover - optional dependency for robot voice UI
     conversation_process = None
     conversation_reset = None
+    conversation_import_error = str(e)
     print(f"WARN: conversation routes unavailable: {e}")
 
 
@@ -45,7 +48,7 @@ class ESPMotionController:
         if cmd == self._last_cmd and (now - self._last_cmd_ts) < cooldown_s:
             return
 
-        print("sending motion", cmd)
+        # print("sending motion", cmd)
         if self._esp is not None:
             try:
                 self._esp.write(cmd.encode())
@@ -92,6 +95,8 @@ class WebStreamer:
         self._latest_jpeg = None
         self._frame_lock = threading.Lock()
         self._frame_cond = threading.Condition(self._frame_lock)
+        self._server = None
+        self._server_thread = None
         self._latest_frame_id = 0
         self._frame_count = 0
         self._latest_audio = {
@@ -101,18 +106,26 @@ class WebStreamer:
             "created_at": 0.0,
             "kind": "none",
         }
+        self._conversation_api_available = conversation_process is not None
+        self._conversation_api_error = conversation_import_error
+        self._last_transcript = ""
+        self._last_emotion = ""
         self._conversation_started = False
+        self._conversation_processing = False
         self._processing_started = False
         self._robot_state = "idle"
         self._robot_direction = "none"
         self._conversation_mood = "happy"
         self._esp_connected = False
         self._esp_error = "ESP32 not connected."
+        self._fatal_error = ""
+        self._fatal_error_ts = 0.0
         self._register_routes()
 
     def _register_routes(self) -> None:
         self._app.add_url_rule("/", "index", self._index)
         self._app.add_url_rule("/robot", "robot", self._robot)
+        self._app.add_url_rule("/emoji.png", "emoji_png", self._emoji_png)
         self._app.add_url_rule("/video_feed", "video_feed", self._video_feed)
         self._app.add_url_rule("/status", "status", self._status)
         self._app.add_url_rule("/api/audio/latest", "audio_latest", self._audio_latest)
@@ -127,6 +140,12 @@ class WebStreamer:
 
     def _robot(self):
         return render_template("robot.html")
+
+    def _emoji_png(self):
+        img_path = Path(self._app.root_path) / "emoji.png"
+        if img_path.exists():
+            return send_file(str(img_path), mimetype="image/png")
+        return ("", 404)
 
     def _mjpeg_generator(self):
         last_sent_id = -1
@@ -158,8 +177,15 @@ class WebStreamer:
             robot_state = self._robot_state
             robot_direction = self._robot_direction
             conversation_mood = self._conversation_mood
+            conversation_processing = self._conversation_processing
+            conversation_api_available = self._conversation_api_available
+            conversation_api_error = self._conversation_api_error
+            last_transcript = self._last_transcript
+            last_emotion = self._last_emotion
             esp_connected = self._esp_connected
             esp_error = self._esp_error
+            fatal_error = self._fatal_error
+            fatal_error_ts = self._fatal_error_ts
         return jsonify(
             {
                 "streaming": has_frame,
@@ -168,8 +194,15 @@ class WebStreamer:
                 "robot_state": robot_state,
                 "robot_direction": robot_direction,
                 "conversation_mood": conversation_mood,
+                "conversation_processing": conversation_processing,
+                "conversation_api_available": conversation_api_available,
+                "conversation_api_error": conversation_api_error,
+                "last_transcript": last_transcript,
+                "last_emotion": last_emotion,
                 "esp_connected": esp_connected,
                 "esp_error": esp_error,
+                "fatal_error": fatal_error,
+                "fatal_error_ts": fatal_error_ts,
             }
         )
 
@@ -179,14 +212,26 @@ class WebStreamer:
         return jsonify(latest_audio)
 
     def _api_process(self):
+        print("[api/process] request received")
+        # Mark processing immediately so motion loop can stay paused end-to-end.
+        self.set_conversation_processing(True)
         resp = make_response(conversation_process())
         try:
             payload = resp.get_json(silent=True) or {}
             if resp.status_code < 400 and not payload.get("error"):
-                # Any valid mic turn counts as user reply starting conversation.
+                self.set_last_transcript(str(payload.get("user_text", "")))
                 self.mark_conversation_started()
+                self.set_fatal_error("")
+            else:
+                # If processing failed, clear the signal so robot can resume.
+                self.clear_conversation_started()
+                err_msg = str(payload.get("error", "Unknown conversation API error"))
+                print(f"[api/process] error: {err_msg}")
+                self.set_fatal_error(f"/api/process failed: {err_msg}")
         except Exception:
-            pass
+            self.clear_conversation_started()
+        finally:
+            self.set_conversation_processing(False)
         return resp
 
     def _api_reset(self):
@@ -248,10 +293,47 @@ class WebStreamer:
             self._conversation_started = False
         return started
 
-    def run(self, host: str = "0.0.0.0", port: int = 5000) -> None:
-        self._app.run(host=host, port=port, debug=False, use_reloader=False, threaded=True)
+    def set_conversation_processing(self, processing: bool) -> None:
+        with self._frame_lock:
+            self._conversation_processing = bool(processing)
+
+    def is_conversation_processing(self) -> bool:
+        with self._frame_lock:
+            return self._conversation_processing
+
+    def set_last_transcript(self, transcript: str) -> None:
+        with self._frame_lock:
+            self._last_transcript = transcript
+
+    def set_last_emotion(self, emotion: str) -> None:
+        with self._frame_lock:
+            self._last_emotion = emotion
+
+    def set_fatal_error(self, message: str) -> None:
+        with self._frame_lock:
+            self._fatal_error = message
+            if message:
+                self._fatal_error_ts = time.time()
+                self._processing_started = False
+            else:
+                self._fatal_error_ts = 0.0
 
     def start_in_thread(self, host: str = "0.0.0.0", port: int = 5000) -> threading.Thread:
-        thread = threading.Thread(target=self.run, args=(host, port), daemon=True)
-        thread.start()
-        return thread
+        if self._server_thread is not None and self._server_thread.is_alive():
+            return self._server_thread
+
+        self._server = make_server(host, port, self._app, threaded=True)
+        self._server_thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._server_thread.start()
+        return self._server_thread
+
+    def stop(self) -> None:
+        if self._server is not None:
+            try:
+                self._server.shutdown()
+            except Exception:
+                pass
+            self._server = None
+        if self._server_thread is not None:
+            self._server_thread.join(timeout=2.0)
+            self._server_thread = None

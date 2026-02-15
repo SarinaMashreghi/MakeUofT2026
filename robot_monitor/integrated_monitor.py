@@ -10,17 +10,35 @@ from ultralytics import YOLO
 try:
     from conversations import machine_conversation_turn
     from conversations import fixed_phrase_tts
+    from conversations import emotion_demo_tts
+    from conversations import phrase_tts, get_emotion_turn_script
 except BaseException as e:  # pragma: no cover - runtime dependency guard
     machine_conversation_turn = None
     fixed_phrase_tts = None
+    emotion_demo_tts = None
+    phrase_tts = None
+    get_emotion_turn_script = None
     print(f"WARN: conversations module unavailable: {e}")
 
 from io_control import ESPMotionController, WebStreamer
 
-PICKUP_INVITE_PHRASE = "Hello, I'm cupid bot, please pick me up if you want company."
+PICKUP_INVITE_PHRASE = "hey im cupid bot, pick me up if you want company"
 INVITE_REPEAT_INTERVAL_S = 10.0
-INVITE_MIN_PLAYS = 3
-POST_REPLY_CONVERSATION_HOLD_S = 6.0
+INVITE_MAX_PLAYS = 2
+USER_REPLY_GRACE_S = 12.0
+POST_REPLY_CONVERSATION_HOLD_S = 15.0
+AUDIO_TURN_DELAY_S = 12.0
+RUNTIME_ERROR_LOG = "runtime_errors.log"
+
+
+def persist_fatal_error(base_dir: Path, message: str) -> None:
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    log_path = base_dir / RUNTIME_ERROR_LOG
+    try:
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {message}\n")
+    except Exception as e:
+        print(f"WARN: Could not write fatal error log: {e}")
 
 
 def on_happy_detected(
@@ -30,21 +48,16 @@ def on_happy_detected(
     conversation_history: List[str],
     web: WebStreamer,
 ) -> float:
-    del person_id, emotion, confidence
-    if machine_conversation_turn is None:
+    del person_id, emotion, confidence, conversation_history
+    if emotion_demo_tts is None:
         return 0.0
 
     try:
-        assistant_text, audio_url, next_history = machine_conversation_turn(
-            mood="happy",
-            history=conversation_history,
-            user_text="Start with a warm, playful greeting and ask one fun short question.",
-        )
-        conversation_history[:] = next_history
-        web.publish_audio(text=assistant_text, audio_url=audio_url, kind="conversation_happy")
-        print(f"[conversation/happy] {assistant_text}")
-        print(f"[conversation/happy] audio: {audio_url}")
-        return 6.0
+        assistant_text, audio_url = emotion_demo_tts("happy")
+        web.publish_audio(text=assistant_text, audio_url=audio_url, kind="conversation_happy_demo")
+        print(f"[conversation/happy/demo] {assistant_text}")
+        print(f"[conversation/happy/demo] audio: {audio_url}")
+        return 14.0
     except Exception as e:
         print(f"WARN: Happy conversation failed: {e}")
         return 0.0
@@ -57,21 +70,16 @@ def on_sad_detected(
     conversation_history: List[str],
     web: WebStreamer,
 ) -> float:
-    del person_id, emotion, confidence
-    if machine_conversation_turn is None:
+    del person_id, emotion, confidence, conversation_history
+    if emotion_demo_tts is None:
         return 0.0
 
     try:
-        assistant_text, audio_url, next_history = machine_conversation_turn(
-            mood="sad",
-            history=conversation_history,
-            user_text="Start with a gentle check-in and one optional low-pressure suggestion.",
-        )
-        conversation_history[:] = next_history
-        web.publish_audio(text=assistant_text, audio_url=audio_url, kind="conversation_sad")
-        print(f"[conversation/sad] {assistant_text}")
-        print(f"[conversation/sad] audio: {audio_url}")
-        return 6.0
+        assistant_text, audio_url = emotion_demo_tts("sad")
+        web.publish_audio(text=assistant_text, audio_url=audio_url, kind="conversation_sad_demo")
+        print(f"[conversation/sad/demo] {assistant_text}")
+        print(f"[conversation/sad/demo] audio: {audio_url}")
+        return 14.0
     except Exception as e:
         print(f"WARN: Sad conversation failed: {e}")
         return 0.0
@@ -91,6 +99,20 @@ def speak_pickup_invite(web: WebStreamer) -> float:
     except Exception as e:
         print(f"WARN: Fixed pickup invite TTS failed: {e}")
         return 0.0
+
+
+def speak_timed_line(web: WebStreamer, text: str, kind: str) -> bool:
+    if phrase_tts is None:
+        return False
+    try:
+        spoken_text, audio_url = phrase_tts(text=text, prefix=kind)
+        web.publish_audio(text=spoken_text, audio_url=audio_url, kind=kind)
+        print(f"[timed-line/{kind}] {spoken_text}")
+        print(f"[timed-line/{kind}] audio: {audio_url}")
+        return True
+    except Exception as e:
+        print(f"WARN: timed line TTS failed ({kind}): {e}")
+        return False
 
 
 def classify_person_emotion(
@@ -306,7 +328,7 @@ def detect_emotion(
 
 
 def main() -> None:
-    webcam_index = 0
+    webcam_index = 1
     yolo_model_path = "./models/yolov8n.pt"
     emotion_model_dir = "./models/hugging_face_vit"
     yolo_conf = 0.50
@@ -356,14 +378,14 @@ def main() -> None:
     max_target_miss_frames = 12
     reacquire_block_until = 0.0
     target_reached_hold_until = 0.0
-    conversation_busy_until = 0.0
-    invite_active = False
-    invite_play_count = 0
-    invite_next_play_at = 0.0
-    invite_reply_received = False
+    timed_conversation_active = False
+    timed_conversation_lines: List[str] = []
+    timed_conversation_idx = 0
+    timed_conversation_next_at = 0.0
     conversation_history: List[str] = []
 
     web.set_processing_started(True)
+    web.set_fatal_error("")
 
     try:
         while True:
@@ -381,78 +403,30 @@ def main() -> None:
             detections: List[Tuple[int, int, int, int, float, str]] = []
             now = time.time()
 
-            if now < conversation_busy_until:
+            if timed_conversation_active:
                 active_target_id = None
                 active_target_bbox = None
                 target_miss_count = 0
                 motion.send_motion_command("S", cooldown_s=0.3)
                 robot_state = "conversation_ongoing"
-                cv2.putText(
-                    frame,
-                    "Conversation ongoing...",
-                    (10, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (255, 200, 200),
-                    2,
-                    cv2.LINE_AA,
-                )
-                dt = time.time() - t0
-                fps = (frame_idx + 1) / dt if dt > 0 else 0.0
-                cv2.putText(
-                    frame,
-                    f"FPS: {fps:.1f} | Persons: {len(detections)}",
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (255, 255, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-                web.set_runtime_state(
-                    robot_state=robot_state,
-                    robot_direction=robot_direction,
-                    esp_connected=motion.is_connected(),
-                    esp_error=motion.get_last_error(),
-                )
-                stream_frame = cv2.resize(frame, (stream_width, stream_height), interpolation=cv2.INTER_AREA)
-                web.publish_frame(stream_frame)
-                frame_idx += 1
-                continue
 
-            if invite_active:
-                active_target_id = None
-                active_target_bbox = None
-                target_miss_count = 0
-                motion.send_motion_command("S", cooldown_s=0.3)
-                robot_state = "awaiting_user_reply"
-
-                if web.consume_conversation_started():
-                    invite_reply_received = True
-
-                should_repeat_invite = now >= invite_next_play_at and (
-                    invite_play_count < INVITE_MIN_PLAYS or not invite_reply_received
-                )
-                if should_repeat_invite:
-                    speak_pickup_invite(web)
-                    invite_play_count += 1
-                    invite_next_play_at = time.time() + INVITE_REPEAT_INTERVAL_S
-
-                if invite_reply_received and invite_play_count >= INVITE_MIN_PLAYS:
-                    invite_active = False
-                    invite_play_count = 0
-                    invite_next_play_at = 0.0
-                    invite_reply_received = False
-                    conversation_busy_until = time.time() + POST_REPLY_CONVERSATION_HOLD_S
-                    robot_state = "conversation_ongoing"
+                if now >= timed_conversation_next_at:
+                    if timed_conversation_idx < len(timed_conversation_lines):
+                        line = timed_conversation_lines[timed_conversation_idx]
+                        speak_timed_line(web, line, "timed_conversation")
+                        timed_conversation_idx += 1
+                        timed_conversation_next_at = time.time() + AUDIO_TURN_DELAY_S
+                    else:
+                        timed_conversation_active = False
+                        timed_conversation_lines = []
+                        timed_conversation_idx = 0
+                        timed_conversation_next_at = 0.0
+                        reacquire_block_until = time.time() + 0.3
+                        robot_state = "idle"
 
                 cv2.putText(
                     frame,
-                    (
-                        "Conversation started. Paused..."
-                        if robot_state == "conversation_ongoing"
-                        else f"Awaiting user reply... invite #{invite_play_count}"
-                    ),
+                    "Timed conversation running..." if robot_state == "conversation_ongoing" else "Conversation done.",
                     (10, 60),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.7,
@@ -619,10 +593,6 @@ def main() -> None:
                     robot_state = "target_reached"
                     robot_direction = "none"
                     target_reached_hold_until = time.time() + 2.0
-                    invite_active = True
-                    invite_play_count = 1
-                    invite_next_play_at = time.time() + INVITE_REPEAT_INTERVAL_S
-                    invite_reply_received = False
                     speak_pickup_invite(web)
                     emotion_label, emotion_conf, box_color, conversation_hold_s = detect_emotion(
                         active_target_id,
@@ -634,9 +604,16 @@ def main() -> None:
                         web,
                         trigger_conversation=False,
                     )
-                    web.set_conversation_mood("happy" if emotion_label == "happy" else "sad")
-                    if conversation_hold_s > 0:
-                        conversation_busy_until = time.time() + conversation_hold_s
+                    mood = "happy" if emotion_label == "happy" else "sad"
+                    timed_conversation_lines = (
+                        get_emotion_turn_script(mood) if get_emotion_turn_script is not None else []
+                    )
+                    timed_conversation_active = len(timed_conversation_lines) > 0
+                    timed_conversation_idx = 0
+                    timed_conversation_next_at = time.time() + AUDIO_TURN_DELAY_S
+                    web.set_last_emotion(f"{emotion_label} ({emotion_conf:.2f})")
+                    print(f"[emotion] label={emotion_label} conf={emotion_conf:.2f}")
+                    web.set_conversation_mood(mood)
 
                     cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
                     label = f"target {p_conf:.2f} | {emotion_label} {emotion_conf:.2f}"
@@ -659,19 +636,12 @@ def main() -> None:
                     break
 
             except Exception as e:
-                print(f"ERROR in frame processing: {e}")
-                cv2.putText(
-                    frame,
-                    f"Processing error: {e}",
-                    (10, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 0, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-                robot_state = "idle"
-                robot_direction = "none"
+                fatal_message = f"FATAL: frame processing error: {e}"
+                print(fatal_message)
+                persist_fatal_error(Path(__file__).resolve().parent, fatal_message)
+                web.set_fatal_error(fatal_message)
+                motion.send_motion_command("S", cooldown_s=0.1)
+                break
 
             dt = time.time() - t0
             fps = (frame_idx + 1) / dt if dt > 0 else 0.0
@@ -688,7 +658,7 @@ def main() -> None:
 
             display_state = robot_state
             if (
-                not invite_active
+                not timed_conversation_active
                 and robot_state != "moving_towards_target"
                 and time.time() < target_reached_hold_until
             ):
@@ -707,7 +677,16 @@ def main() -> None:
             if frame_idx % 30 == 0:
                 print(f"Loop alive. frame_idx={frame_idx}, detections={len(detections)}")
 
+    except KeyboardInterrupt:
+        print("Shutdown requested from terminal (Ctrl+C).")
+    except Exception as e:
+        fatal_message = f"FATAL: main loop crashed: {e}"
+        print(fatal_message)
+        persist_fatal_error(Path(__file__).resolve().parent, fatal_message)
+        web.set_fatal_error(fatal_message)
     finally:
+        web.set_processing_started(False)
+        web.stop()
         cap.release()
         motion.close()
 
